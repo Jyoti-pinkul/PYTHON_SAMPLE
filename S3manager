@@ -1,0 +1,126 @@
+import boto3
+import pymysql
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError
+
+
+class AuroraDatabase:
+    def __init__(self, host, user, password, database):
+        self.host = host
+        self.user = user
+        self.password = password
+        self.database = database
+        self.connection = None
+
+    def connect(self):
+        try:
+            self.connection = pymysql.connect(
+                host=self.host,
+                user=self.user,
+                password=self.password,
+                database=self.database,
+            )
+        except Exception as e:
+            print(f"Failed to connect to Aurora DB: {e}")
+            raise
+
+    def get_entries(self, name, limit, offset):
+        query = f"SELECT * FROM your_table WHERE name = '{name}' LIMIT {limit} OFFSET {offset}"
+        with self.connection.cursor() as cursor:
+            cursor.execute(query)
+            return cursor.fetchall()
+
+    def get_count(self, name):
+        query = f"SELECT COUNT(*) FROM your_table WHERE name = '{name}'"
+        with self.connection.cursor() as cursor:
+            cursor.execute(query)
+            return cursor.fetchone()[0]
+
+    def close(self):
+        if self.connection:
+            self.connection.close()
+
+
+class S3Manager:
+    def __init__(self, bucket_name):
+        self.s3_client = boto3.client('s3')
+        self.bucket_name = bucket_name
+
+    def get_object(self, key):
+        try:
+            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=key)
+            return response['Body'].read().decode('utf-8')
+        except Exception as e:
+            print(f"Error fetching object from S3: {e}")
+            raise
+
+    def copy_object(self, source_key, dest_bucket, dest_key):
+        copy_source = {'Bucket': self.bucket_name, 'Key': source_key}
+        self.s3_client.copy_object(CopySource=copy_source, Bucket=dest_bucket, Key=dest_key)
+
+
+class FileHandler:
+    @staticmethod
+    def write_to_file(file_path, data):
+        with open(file_path, 'a') as f:
+            f.write(data + '\n')
+
+
+class EntryProcessor:
+    def __init__(self, aurora_db, source_s3, dest_s3, efs_mount_path, reference_s3):
+        self.aurora_db = aurora_db
+        self.source_s3 = source_s3
+        self.dest_s3 = dest_s3
+        self.efs_mount_path = efs_mount_path
+        self.reference_s3 = reference_s3
+
+    def process_entries(self, name):
+        total_entries = self.aurora_db.get_count(name)
+        print(f"Total entries with name '{name}': {total_entries}")
+        if total_entries > 10000:
+            limit = 100
+            offset = 0
+            while offset < total_entries:
+                entries = self.aurora_db.get_entries(name, limit, offset)
+                for entry in entries:
+                    file_key = entry['file_key']
+                    file_content = self.source_s3.get_object(file_key)
+                    for row in file_content.splitlines():
+                        if row in self.reference_s3:
+                            dest_key = f"processed/{file_key}"
+                            self.source_s3.copy_object(file_key, self.dest_s3.bucket_name, dest_key)
+                        else:
+                            missing_entry_file = f"{self.efs_mount_path}/missing_entries.txt"
+                            FileHandler.write_to_file(missing_entry_file, row)
+                offset += limit
+
+
+# Configuration and Usage
+aurora_config = {
+    "host": "aurora-db-endpoint",
+    "user": "your-username",
+    "password": "your-password",
+    "database": "your-database"
+}
+
+source_bucket = "source-bucket-name"
+dest_bucket = "destination-bucket-name"
+reference_bucket = "reference-bucket-name"
+efs_mount_path = "/mnt/efs"
+
+try:
+    aurora_db = AuroraDatabase(**aurora_config)
+    aurora_db.connect()
+
+    source_s3 = S3Manager(source_bucket)
+    dest_s3 = S3Manager(dest_bucket)
+    reference_s3 = S3Manager(reference_bucket)
+
+    processor = EntryProcessor(aurora_db, source_s3, dest_s3, efs_mount_path, reference_s3)
+    processor.process_entries("123")
+
+except (NoCredentialsError, PartialCredentialsError):
+    print("AWS credentials not found or incomplete.")
+except Exception as e:
+    print(f"An error occurred: {e}")
+finally:
+    aurora_db.close()
